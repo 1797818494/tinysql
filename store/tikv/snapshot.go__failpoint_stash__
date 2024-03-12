@@ -23,7 +23,6 @@ import (
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/kvrpcpb"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
-	"github.com/pingcap/log"
 	"github.com/pingcap/tidb/kv"
 
 	"github.com/pingcap/tidb/store/tikv/tikvrpc"
@@ -100,11 +99,11 @@ func (s *tikvSnapshot) get(bo *Backoffer, k kv.Key) ([]byte, error) {
 		}
 	}
 
-	if _, ok := failpoint.Eval(_curpkg_("snapshot-get-cache-fail")); ok {
+	failpoint.Inject("snapshot-get-cache-fail", func(_ failpoint.Value) {
 		if bo.ctx.Value("TestSnapshotCache") != nil {
 			panic("cache miss")
 		}
-	}
+	})
 
 	cli := clientHelper{
 		LockResolver:      s.store.lockResolver,
@@ -156,16 +155,11 @@ func (s *tikvSnapshot) get(bo *Backoffer, k kv.Key) ([]byte, error) {
 				return nil, errors.Trace(err1)
 			}
 			locks = append(locks, lock)
-			// lock here
-			if lock == nil {
-				return val, nil
-			}
+
 			msBeforeExpired, _, err := s.store.lockResolver.ResolveLocks(bo, 0, locks)
 			if err != nil {
-				log.Info("resolve lock err")
 				return nil, errors.Trace(err)
 			}
-			//
 			if msBeforeExpired > 0 {
 				err = bo.BackoffWithMaxSleep(BoTxnLock, int(msBeforeExpired), errors.Errorf("2PC prewrite lockedKeys: %d", len(locks)))
 				if err != nil {
@@ -174,7 +168,6 @@ func (s *tikvSnapshot) get(bo *Backoffer, k kv.Key) ([]byte, error) {
 			}
 			continue
 		}
-		log.Info("get value")
 		return val, nil
 	}
 }
@@ -199,12 +192,12 @@ func extractLockFromKeyErr(keyErr *pb.KeyError) (*Lock, error) {
 }
 
 func extractKeyErr(keyErr *pb.KeyError) error {
-	if val, ok := failpoint.Eval(_curpkg_("ErrMockRetryableOnly")); ok {
+	failpoint.Inject("ErrMockRetryableOnly", func(val failpoint.Value) {
 		if val.(bool) {
 			keyErr.Conflict = nil
 			keyErr.Retryable = "mock retryable error"
 		}
-	}
+	})
 
 	if keyErr.Conflict != nil {
 		return newWriteConflictError(keyErr.Conflict)

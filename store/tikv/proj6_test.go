@@ -4,11 +4,12 @@ import (
 	"context"
 	"math/rand"
 
-	"github.com/pingcap/failpoint"
-	"github.com/pingcap/tidb/parser/terror"
+	"github.com/pingcap-incubator/tinykv/log"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/kvrpcpb"
 	. "github.com/pingcap/check"
+	"github.com/pingcap/failpoint"
 	"github.com/pingcap/tidb/kv"
+	"github.com/pingcap/tidb/parser/terror"
 	"github.com/pingcap/tidb/store/mockstore/mocktikv"
 	"github.com/pingcap/tidb/store/tikv/tikvrpc"
 )
@@ -16,7 +17,7 @@ import (
 type testProj6Suite struct {
 	OneByOneSuite
 	cluster *mocktikv.Cluster
-	store *tikvStore
+	store   *tikvStore
 }
 
 var _ = Suite(&testProj6Suite{})
@@ -58,6 +59,7 @@ func (s *testProj6Suite) checkValues(c *C, m map[string]string) {
 func (s *testProj6Suite) mustNotExist(c *C, keys ...[]byte) {
 	txn := s.begin(c)
 	for _, k := range keys {
+
 		_, err := txn.Get(context.TODO(), k)
 		c.Assert(err, NotNil)
 		c.Check(terror.ErrorEqual(err, kv.ErrNotExist), IsTrue)
@@ -297,7 +299,6 @@ func (s *testProj6Suite) TestUnCommit(c *C) {
 		"k1": "v1",
 		"k2": "v2",
 	})
-
 	s.mustNotExist(c, k1, k2)
 }
 
@@ -397,6 +398,7 @@ func (s *testProj6Suite) TestResolveLock(c *C) {
 	status, err := lr.GetTxnStatus(txn.StartTS(), committer.commitTS+1, k1)
 	c.Assert(err, IsNil)
 	// the transaction status from primary key is committed
+	log.Infof("%v", status)
 	c.Assert(status.IsCommitted(), IsTrue)
 	// resolve the lock for committed transactions
 	for _, k := range [][]byte{k2, k3} {
@@ -460,22 +462,24 @@ func (s *testProj6Suite) TestGetResolveLockCommit(c *C) {
 	s.mustGetLock(c, k2)
 
 	// transaction with smaller startTS will not see the lock
+	// startTs lock
 	txn1 := s.beginWithStartTs(c, txn.startTS-1)
 	_, err = txn1.Get(context.Background(), k2)
 	c.Check(terror.ErrorEqual(err, kv.ErrNotExist), IsTrue)
 
 	// check the lock is still exist
+	log.Infof("stone flag here")
 	s.mustGetLock(c, k2)
 
 	// tinysql will always use the latest ts to try resolving the lock
 	txn2 := s.beginWithStartTs(c, committer.commitTS+1)
+	log.Infof("stone flag here")
 	val, err := txn2.Get(context.Background(), k2)
 	c.Assert(err, IsNil)
 	c.Assert(val, BytesEquals, []byte("b"))
 
 	s.mustUnLock(c, k2)
 }
-
 
 func (s *testProj6Suite) TestGetResolveLockRollback(c *C) {
 	txn, committer := s.preparePrewritedTxn(c, "a", map[string]string{

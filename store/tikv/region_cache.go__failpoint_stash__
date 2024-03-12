@@ -291,11 +291,11 @@ func (c *RegionCache) GetTiKVRPCContext(bo *Backoffer, id RegionVerID, replicaRe
 		return nil, err
 	}
 	// enable by `curl -XPUT -d '1*return("[some-addr]")->return("")' http://host:port/github.com/pingcap/tidb/store/tikv/injectWrongStoreAddr`
-	if val, ok := failpoint.Eval(_curpkg_("injectWrongStoreAddr")); ok {
+	failpoint.Inject("injectWrongStoreAddr", func(val failpoint.Value) {
 		if a, ok := val.(string); ok && len(a) > 0 {
 			addr = a
 		}
-	}
+	})
 	if store == nil || len(addr) == 0 {
 		// Store not found, region must be out of date.
 		cachedRegion.invalidate()
@@ -454,29 +454,21 @@ func (c *RegionCache) LocateRegionByID(bo *Backoffer, regionID uint64) (*KeyLoca
 // filter is used to filter some unwanted keys.
 func (c *RegionCache) GroupKeysByRegion(bo *Backoffer, keys [][]byte, filter func(key, regionStartKey []byte) bool) (map[RegionVerID][][]byte, RegionVerID, error) {
 	// YOUR CODE HERE (proj6).
-	// c.mu.RWMutex.RLock()
-	// defer c.mu.RWMutex.RUnlock()
+	c.mu.RWMutex.RLock()
+	defer c.mu.RWMutex.RUnlock()
 	groupRegionKeyMap := make(map[RegionVerID][][]byte, 0)
 	var primaryKeyRegionVer RegionVerID
 	for index, key := range keys {
-		keyLocation, err := c.LocateKey(bo, key)
-		if err != nil {
-			return nil, primaryKeyRegionVer, err
-		}
-		region := c.getCachedRegionWithRLock(keyLocation.Region)
-		if err != nil {
-			return nil, primaryKeyRegionVer, err
-		}
-
-		if region.Contains(key) {
-			regionVer := region.VerID()
-			groupRegionKeyMap[regionVer] = append(groupRegionKeyMap[regionVer], key)
-			if index == 0 {
-				primaryKeyRegionVer = regionVer
+		for regionVer, region := range c.mu.regions {
+			if filter(key, region.meta.GetStartKey()) {
+				groupRegionKeyMap[regionVer] = append(groupRegionKeyMap[regionVer], key)
+				if index == 0 {
+					primaryKeyRegionVer = regionVer
+				}
+				break
 			}
 		}
 	}
-	//log.S().Infof("primary Region %v, map[%v] keys[%v]", groupRegionKeyMap, primaryKeyRegionVer, keys)
 	return groupRegionKeyMap, primaryKeyRegionVer, nil
 }
 

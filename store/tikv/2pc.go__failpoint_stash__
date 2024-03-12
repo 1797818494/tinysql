@@ -23,7 +23,6 @@ import (
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/kvrpcpb"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
-	"github.com/pingcap/log"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/parser/terror"
 	"github.com/pingcap/tidb/store/tikv/tikvrpc"
@@ -250,18 +249,8 @@ func (c *twoPhaseCommitter) doActionOnKeys(bo *Backoffer, action twoPhaseCommitA
 		return nil
 	}
 	groups, firstRegion, err := c.store.regionCache.GroupKeysByRegion(bo, keys, nil)
-
-	log.S().Infof("prewrite firstRegion{%v} haserr{%v}", firstRegion, err != nil)
 	if err != nil {
-		panic("here")
-		err = bo.Backoff(BoRegionMiss, err)
-		if err != nil {
-			return err
-		}
-		groups, firstRegion, err = c.store.regionCache.GroupKeysByRegion(bo, keys, nil)
-		if err != nil {
-			return err
-		}
+		return errors.Trace(err)
 	}
 
 	var batches []batchKeys
@@ -291,7 +280,6 @@ func (c *twoPhaseCommitter) doActionOnKeys(bo *Backoffer, action twoPhaseCommitA
 		if err != nil {
 			return errors.Trace(err)
 		}
-		log.S().Infof("commit success, primary key %v", batches[0])
 		batches = batches[1:]
 	}
 	if actionIsCommit {
@@ -358,35 +346,31 @@ func (c *twoPhaseCommitter) keySize(key []byte) int {
 }
 
 func (c *twoPhaseCommitter) buildPrewriteRequest(batch batchKeys) *tikvrpc.Request {
-	var req *pb.PrewriteRequest = new(pb.PrewriteRequest)
+	var req *pb.PrewriteRequest
 	// YOUR CODE HERE (proj6).
 	c.mu.RWMutex.RLock()
-	defer c.mu.RWMutex.RUnlock()
+	defer c.mu.Unlock()
 	for _, key := range batch.keys {
 		req.Mutations = append(req.Mutations, &c.mutations[string(key)].Mutation)
 	}
 	req.LockTtl = c.lockTTL
-	req.StartVersion = c.startTS
-	req.PrimaryLock = c.primary()
+	req.PrimaryLock = c.primaryKey
 	// TODO context
-	log.S().Infof("prewrite primary key %v", c.primary())
 	return tikvrpc.NewRequest(tikvrpc.CmdPrewrite, req, pb.Context{})
 }
 
 func (c *twoPhaseCommitter) buildRollbackRequest(batch batchKeys) *tikvrpc.Request {
-	var req *pb.BatchRollbackRequest = new(pb.BatchRollbackRequest)
+	var req *pb.BatchRollbackRequest
 	c.mu.RWMutex.RLock()
 	defer c.mu.RWMutex.RUnlock()
 	req.Keys = batch.keys
 	req.StartVersion = c.startTS
 	return tikvrpc.NewRequest(tikvrpc.CmdBatchRollback, req, pb.Context{})
 }
-
 func (c *twoPhaseCommitter) buildCommitRequest(batch batchKeys) *tikvrpc.Request {
-	var req *pb.CommitRequest = new(pb.CommitRequest)
+	var req *pb.CommitRequest
 	c.mu.RWMutex.RLock()
-	defer c.mu.RWMutex.RUnlock()
-	log.S().Infof("commitTs in commitPhase{%v} startTs{%v}", c.commitTS, c.startTS)
+	defer c.mu.Unlock()
 	req.CommitVersion = c.commitTS
 	req.Keys = batch.keys
 	req.StartVersion = c.startTS
@@ -460,10 +444,10 @@ func (c *twoPhaseCommitter) getUndeterminedErr() error {
 
 func (actionCommit) handleSingleBatch(c *twoPhaseCommitter, bo *Backoffer, batch batchKeys) error {
 	// follow actionPrewrite.handleSingleBatch, build the commit request
-	var sender *RegionRequestSender = new(RegionRequestSender)
+	var sender *RegionRequestSender
 	sender.regionCache = c.store.regionCache
 	sender.client = c.store.client
-	//sender.storeAddr = c.store.etcdAddrs[]
+	sender.storeAddr = c.store.etcdAddrs[0]
 	// build and send the commit request
 
 	// YOUR CODE HERE (proj6).
@@ -480,11 +464,11 @@ func (actionCommit) handleSingleBatch(c *twoPhaseCommitter, bo *Backoffer, batch
 			c.setUndeterminedErr(errors.Trace(sender.rpcError))
 		}
 
-		if _, ok := failpoint.Eval(_curpkg_("mockFailAfterPK")); ok {
+		failpoint.Inject("mockFailAfterPK", func() {
 			if !isPrimary {
 				err = errors.New("commit secondary keys error")
 			}
-		}
+		})
 		if err != nil {
 			return errors.Trace(err)
 		}
@@ -511,7 +495,6 @@ func (actionCommit) handleSingleBatch(c *twoPhaseCommitter, bo *Backoffer, batch
 			// Group that contains primary key is always the first.
 			// We mark transaction's status committed when we receive the first success response.
 			c.mu.committed = true
-			log.S().Infof("commit success %v", commitResp)
 			return nil
 		}
 		// lock err
@@ -572,25 +555,25 @@ func (actionCleanup) handleSingleBatch(c *twoPhaseCommitter, bo *Backoffer, batc
 		if resp.Resp == nil {
 			return errors.Trace(ErrBodyMissing)
 		}
-		rollbackResp := resp.Resp.(*pb.BatchRollbackResponse)
-		keyErr := rollbackResp.GetError()
-		if keyErr == nil {
+		rollbackResp := resp.Resp.(*pb.PrewriteResponse)
+		keyErrs := rollbackResp.GetErrors()
+		if len(keyErrs) == 0 {
 			return nil
 		}
 		var locks []*Lock
-
-		lock, err1 := extractLockFromKeyErr(keyErr)
-		if err1 != nil {
-			return errors.Trace(err1)
+		for _, keyErr := range keyErrs {
+			lock, err1 := extractLockFromKeyErr(keyErr)
+			if err1 != nil {
+				return errors.Trace(err1)
+			}
+			if keyErr.Abort != "" {
+				return errors.New(keyErr.Abort)
+			}
+			logutil.BgLogger().Debug("rollback encounters lock",
+				zap.Uint64("conn", c.connID),
+				zap.Stringer("lock", lock))
+			locks = append(locks, lock)
 		}
-		if keyErr.Abort != "" {
-			return errors.New(keyErr.Abort)
-		}
-		logutil.BgLogger().Debug("rollback encounters lock",
-			zap.Uint64("conn", c.connID),
-			zap.Stringer("lock", lock))
-		locks = append(locks, lock)
-
 		// Set callerStartTS to 0 so as not to update minCommitTS.
 		msBeforeExpired, _, err := c.store.lockResolver.ResolveLocks(bo, 0, locks)
 		if err != nil {

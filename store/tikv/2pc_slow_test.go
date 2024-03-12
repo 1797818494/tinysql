@@ -11,11 +11,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build !race
 // +build !race
 
 package tikv
 
-import . "github.com/pingcap/check"
+import (
+	"github.com/pingcap-incubator/tinykv/log"
+	. "github.com/pingcap/check"
+)
 
 // TestCommitMultipleRegions tests commit multiple regions.
 // The test takes too long under the race detector.
@@ -26,7 +30,7 @@ func (s *testCommitterSuite) TestCommitMultipleRegions(c *C) {
 		m[k] = v
 	}
 	s.mustCommit(c, m)
-
+	log.Infof("big values")
 	// Test big values.
 	m = make(map[string]string)
 	for i := 0; i < 50; i++ {
